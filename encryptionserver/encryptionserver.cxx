@@ -1,0 +1,1002 @@
+/////////////////////////////////////////////////
+//                                             //
+// encryptionserver:                           //
+// This server encrypts/decrypts data.         //
+// This is meant to replace the ciphertext     //  
+// executable.                                 //
+//                                             //
+// Server framework provided by Paul Franklin. //
+// The rest was written by Aaron DeLong.       //
+// Last modified: August 17, 2001.             //
+/////////////////////////////////////////////////
+/*
+     Protocol description:
+
+     CMD=ENCRYPT;TEXT=<URLEncoded text>
+     CMD=DECRYPT;TEXT=<URLEncoded data>
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <signal.h>
+#include <ctype.h>
+#include <time.h>
+#include <stdarg.h>
+#include <unistd.h>
+#include <errno.h>
+#include <iostream.h>
+#include <fstream.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <pthread.h>
+#include <openssl/blowfish.h>
+#include <openssl/des.h>
+
+#include "tcpsock.hxx"
+#include "sock.hxx"		// API
+#include "ptl.hxx"		// thread class
+#include "encryptionserver.hxx"
+#include "configclass.h"
+#include "debugclass.h"
+#include "common.hxx"
+
+#ifdef DEBUGGING
+# define DEBUG(p1,p2)	logger(thrd_id,0,"DEBUG: %s %d",p1,p2)
+#else
+# define DEBUG(p1,p2)
+#endif
+
+#define SUBSYSNAME	"encryptionserver"
+#define MKSTR(p1)	#p1
+#define XPAND(p1)	MKSTR(p1)
+#define PTR_FAILED	((void *)-1)
+#define countof(p1)	(sizeof(p1) / sizeof(p1[0]))
+
+
+
+typedef short			EnumType;
+
+static int			runlevel = 1;
+static int			this_instance;
+static int			this_pid;
+static struct _thrd_info	*pti = NULL;
+static pthread_mutex_t		hdl_mutex;
+
+
+// config items
+// These are read from a config file.  The values given here are defaults
+// used in the event the config file values can't be read.
+static int			CFG_MAX_THREADS = 32;
+static char			*CFG_JNI_PORT = "10020";
+static char			*CFG_LOG_PATH = ".";
+static char                     *CFG_DEBUG = "OFF";
+
+#define BUFFSIZE 16384
+
+char * _itoa ( int val, char *szret, int radix);
+escstring escClass;
+
+// ======================================================================
+// skips over whitespace in NULL-terminated line
+// ======================================================================
+static char *skip_whitespace(char *line)
+ {
+ if(!line)
+        return NULL;
+
+ while(*line)
+        {
+        if((*line != ' ') && (*line != '\t'))
+                return line;
+
+        ++line;
+        }
+
+ return NULL;
+ }
+
+
+
+
+// ======================================================================
+// Generates a log entry
+// ======================================================================
+void logger(ThrdId id,int level,char *format,...)
+ {
+ char		tbuff[32];
+ time_t		tval;
+ va_list	args;
+ FILE		*where;
+
+ where = pti[id].ti_log_fp;
+ level *= 4;
+
+ if (strcmp(CFG_DEBUG, "ON")==0) {
+           time(&tval);
+           ctime_r(&tval,tbuff);
+           tbuff[24] = '\0';
+           va_start(args,format);
+           fprintf(where,"I%03d:T%03d %s %*s",this_instance,id,tbuff,level," ");
+           vfprintf(where,format,args);
+           fprintf(where,"\n");
+           fflush(where);
+
+           va_end(args);
+ }
+ }	// logger
+
+// ======================================================================
+// signal handler
+// ======================================================================
+static void sig_handler(int signum)
+ {
+ int pid,status,x,rval,coreflag;
+
+ logger(0,0,"instance %d received signal %d, run level %d",this_instance,signum,runlevel);
+
+ if(signum == SIGTERM)
+	{
+	if(runlevel-- == 1)
+		signal(SIGTERM,sig_handler);
+	else
+		signal(SIGTERM,SIG_DFL);
+	}
+ }	// sig_handler
+
+
+
+// ======================================================================
+// ======================================================================
+static char *get_opt(char **opts)
+ {
+ char *pc,*rval = NULL;
+
+ if(!(*opts))
+	return rval;
+
+ if(!(**opts))
+	return rval;
+
+ rval = *opts;
+ if((pc = strchr(rval,';')))
+	*pc++ = '\0';
+
+ *opts = pc;
+
+ return rval;
+ }
+
+// ======================================================================
+// ======================================================================
+static int get_pair(char **name,char **value,char *opt)
+ {
+ char *pc;
+
+ *name = NULL;
+ *value = NULL;
+
+ if(!opt)
+	return -1;
+
+ if(!(*opt))
+	return -1;
+
+ if((pc = strchr(opt,'=')))
+	{
+	*pc++ = '\0';
+	*name = opt;
+	*value = pc;
+
+	return 0;
+	}
+
+ return -1;
+ }
+
+
+//==================================================================
+// Utility methods needed to implement functionality
+//==================================================================
+
+int ahtoi(char c)
+ {
+ int    i;
+
+ i = (int)(c - '0');
+ if(i > 9)
+    i -= 7;
+
+ return i;
+ }
+
+
+char itoha(int i)
+{
+char    c;
+
+c = (char)(i + '0');
+if(c > '9')
+    c += 7;
+
+return c;
+}
+
+unsigned char *str_unescape(char *s,int *size)
+ {
+ unsigned char   c,*cp = (unsigned char *)s;
+
+ while((c = *cp))
+    {
+    if(c == '+')
+        *cp = ' ';
+    
+    if(c == '%')
+        {
+        c = (unsigned char)((ahtoi(cp[1]) << 4) | ahtoi(cp[2]));
+        *cp = c;
+        memmove(&cp[1],&cp[3],strlen((const char *)&cp[3]) + 1);
+        } 
+    cp++;
+    }
+ 
+ *size = (int)(cp - (unsigned char *)s);
+ return (unsigned char *)s;
+ }
+
+
+char *str_escape(unsigned char *s,int len,int esc_flag)
+ {
+ unsigned char   c,*ps;
+ char *pesc;
+ int    newlen,pass,di,savelen;
+
+ pesc=new char[(len*3)+1];
+ memset(pesc, 0, (len*3)+1);
+
+ if(len == -1)
+    len = strlen((const char *)s);
+    
+ newlen = savelen = len;
+ for(pass = 0;pass < 2;pass++)
+    {
+    ps = s;
+    if(pass == 1)
+        {
+        di = 0;
+        }
+
+    while(len--)
+        {
+		c = *ps++;
+        if((c == (unsigned char)' ') && (esc_flag == ESC_NORMAL))
+            {
+            if(pass == 0)
+                continue;
+            else
+                {
+                pesc[di++] = '+';
+                continue;
+                }
+            }
+        if((c >= (unsigned char)'0') && (c <= (unsigned char)'9'))
+            {
+            if(pass == 0)
+                continue;
+            else
+                {
+                pesc[di++] = (char)c;
+                continue;
+                }
+            }
+        if((c >= (unsigned char)'A') && (c <= (unsigned char)'z'))
+            {
+            if(pass == 0)
+                continue;
+            else
+                {
+                pesc[di++] = (char)c;
+                continue;
+                }
+            }
+
+        if(pass == 1)
+            {
+            pesc[di++] = '%';
+            pesc[di++] = itoha(c >> 4);
+            pesc[di++] = itoha(c & 0x0f);
+            }
+
+        newlen += 2;
+        }
+	
+	len = savelen;
+    }
+
+ pesc[di] = '\0';
+ return pesc;
+ }
+
+// ============================================
+// Send the server response back to the client.
+// Make sure to send the data in 4K chunks.
+// ============================================
+static int write_response(tcpsock *pSock, char *ReturnVal) 
+{
+        int len=0, counter=0, size=0, totalcount=0;
+        int maxsize=4095;
+        char *tmpval;
+        if (ReturnVal!=NULL) len=strlen(ReturnVal);
+        else return -1;
+	  if (len>maxsize) {
+             while (counter<len) {
+                  size=len-counter;
+                  if (size>maxsize) size=maxsize;
+                  tmpval=new char[maxsize+2];
+                  memset(tmpval, 0, maxsize+2);
+                  strncpy(tmpval, ReturnVal+counter, size);
+                  tmpval[size+1]='\0';
+                  pSock->Write(tmpval, size);
+                  delete tmpval;
+                  counter+=size;
+             }
+        } else pSock->Write(ReturnVal, len);
+        return 0;
+}
+
+
+static NwnStatus ProcENCRYPT(tcpsock *pSock,char *opts,ThrdId thrd_id)
+{
+ int rc=0, nsize=0;
+ char *pc,*name,*value,*text=NULL;
+
+ logger(thrd_id, 1, "Starting ProcENCRYPT");
+ while (rc>=0) {
+      pc=get_opt(&opts);
+      rc=get_pair(&name,&value,pc);
+      if (rc<0) break;
+      if (strcmp(name, "TEXT")==0) {
+           text=new char[strlen(value)+1];
+	   memset(text, 0, strlen(value)+1);
+	   strcpy(text, value);
+           text=(char *)str_unescape(text, &nsize);
+      }  
+ }
+ if (text==NULL || strlen(text)==0) {
+      logger(thrd_id, 1, "Text to encrypt wasn't given...exiting");
+      write_response(pSock, "ERROR: The text to encrypt was not given!\n");
+      delete text;
+      return -1;
+ } else logger(thrd_id, 1, "Encrypting data: %s", text);
+ BF_KEY *ks=new BF_KEY;
+ char *keydata=new char[256];
+	
+ //Set the key for encryption/decryption
+ memset(keydata, 0, 256);
+ strcpy(keydata, "q*&fjghnvciu109*()1298fjvncsawei");
+ //strcpy(keydata, "Mary had a little lamb, its fleece was white as snow.  It went with her everywhere.");
+ BF_set_key(ks, strlen(keydata), (unsigned char *)keydata);
+
+ logger(thrd_id, 1, "After setting key value");
+ int len = strlen(text) + 1;
+
+ logger(thrd_id, 1, "Allocating memory for ivec buffer");
+ unsigned char *ivec=new unsigned char[len*3];
+ memset(ivec, 0, len*3);
+
+ logger(thrd_id, 1, "Allocating memory for outdata buffer");
+ char *outdata=new char[len*4];
+ memset(outdata, 0, len*4);
+ int num=0;
+	
+ //Encrypts using DES algorithm.  outdata will contain encrypted text.
+ logger(thrd_id, 1, "Before encrypting data");
+ BF_cfb64_encrypt((unsigned char *)text, (unsigned char *)outdata, len, ks, ivec, &num, BF_ENCRYPT);
+ outdata[len+1]='\0';
+ logger(thrd_id, 1, "After encrypting data");
+ logger(thrd_id, 1, "Before allocating memory for return value");
+ logger(thrd_id, 1, "Strlen outdata: %d", strlen(outdata));
+ char *returnstr=new char[(strlen(text)*3)+2];
+ logger(thrd_id, 1, "After allocating memory for return value");
+ memset(returnstr, 0, (strlen(text)*3)+2);
+ char *tmpreturn=str_escape((unsigned char *)outdata, strlen(text), ESC_NORMAL);
+ sprintf(returnstr, "%s\n", tmpreturn);
+ logger(thrd_id, 1, "Sending response: %s", returnstr);
+ write_response(pSock, returnstr);
+ logger(thrd_id, 1, "Freeing memory");
+ delete returnstr;
+ delete tmpreturn;
+ delete keydata;
+ delete outdata;
+ delete ivec;
+ delete text;
+ delete ks;
+ logger(thrd_id, 1, "Exiting");
+ return 0;
+}
+
+
+static NwnStatus ProcDECRYPT(tcpsock *pSock,char *opts,ThrdId thrd_id)
+{
+ int rc=0;
+ char *pc,*name,*value,*text=NULL;
+
+ logger(thrd_id, 1, "Starting ProcDECRYPT");
+ while (rc>=0) {
+      pc=get_opt(&opts);
+      rc=get_pair(&name,&value,pc);
+      if (rc<0) break;
+      if (strcmp(name, "TEXT")==0) {
+           text=new char[strlen(value)+1];
+           memset(text, 0, strlen(value)+1);
+           strcpy(text, value);
+      }  
+ }
+ if (text==NULL || strlen(text)==0) {
+      write_response(pSock, "ERROR: The text to decrypt was not given!\n");
+      if (text) delete text;
+      return -1;
+ }
+ BF_KEY *ks=new BF_KEY;
+ char *keydata=new char[256];
+ memset(keydata, 0, 256);
+ int size=0;
+	
+ //Set the key for encryption/decryption
+ strcpy(keydata, "q*&fjghnvciu109*()1298fjvncsawei");
+ //strcpy(keydata, "Mary had a little lamb, its fleece was white as snow.  It went with her everywhere.");
+ BF_set_key(ks, strlen(keydata), (unsigned char *)keydata);
+
+ logger(thrd_id, 1, "After setting key");
+ unsigned char *finaltext=str_unescape(text, &size);
+ int len = size + 1;
+
+ unsigned char *ivec=new unsigned char[len*4];
+ memset(ivec, 0, len*4);
+
+ char *outdata=new char[len*4];
+ memset(outdata, 0, len*4);
+ int num=0;
+ //Decrypts data in indata, puts result into outdata.
+ logger(thrd_id, 1, "Decrypting data");
+ BF_cfb64_encrypt(finaltext, (unsigned char *)outdata, len, ks, ivec, &num, BF_DECRYPT);
+ outdata[len-1]='\0';
+ logger(thrd_id, 1, "After decrypting data");
+ char *returnstr=new char[(strlen(outdata)*3)+10];
+ logger(thrd_id, 1, "After allocating memory for return value");
+ memset(returnstr, 0, (strlen(outdata)*3)+10);
+ sprintf(returnstr, "%s\n", outdata);
+ logger(thrd_id, 1, "Writing response: %s", returnstr);
+ write_response(pSock, returnstr);
+ logger(thrd_id, 1, "Freeing memory");
+ delete ks;
+ delete returnstr;
+ delete outdata;
+ delete keydata;
+ delete ivec;
+ delete text;
+ logger(thrd_id, 1, "Exiting");
+ return 0;
+}
+
+// ======================================================================
+// ======================================================================
+static NwnStatus ProcessRequests(tcpsock *pSock,char *cmdbuff,ThrdId thrd_id)
+ {
+// s - string
+// u - URL encoded string
+// n - numeric string
+// i - IP address (dotted notation)
+// CMD=SEND;TO=s,s,s;REPLY=s,s,s;
+
+
+ logger(thrd_id, 1, "CMDBUFF: %s", cmdbuff);
+ if(memcmp(cmdbuff,"CMD=",4))
+	return -1;
+
+ cmdbuff += 4;
+
+ switch(cmdbuff[0])
+	{
+	/*case 'C':
+
+	break;*/
+
+	case 'D':
+	     if (!memcmp(cmdbuff, "DECRYPT", 7))
+                  return ProcDECRYPT(pSock,&cmdbuff[8],thrd_id);
+
+	break;
+
+	case 'E':
+	     if (!memcmp(cmdbuff, "ENCRYPT", 7))
+                  return ProcENCRYPT(pSock,&cmdbuff[8],thrd_id);
+
+	break;
+
+        case 'F':
+	
+	break;
+
+	case 'G':
+
+	break;
+
+	
+       case 'P':
+             
+        break;
+
+
+	case 'R':
+	
+
+	break;
+
+        case 'S':
+            
+        break;
+	case 'T':
+
+	break;
+
+	default:
+	break;
+	}
+
+ logger(thrd_id,1,"ERROR: bad cmd: %s",cmdbuff);
+ return -1;
+ }
+
+// ======================================================================
+// ======================================================================
+static NwnStatus HandleRequests(tcpsock *pSock, ThrdId thrd_id)
+ {
+ NwnStatus	stat = NwnStatusOK;
+ char		*pc, tbuff[7000];
+ int		rc,idx = 0;
+
+ // command processing loop
+ while(stat == NwnStatusOK)
+	{
+	// command line reading loop
+	for(;;)
+		{
+		rc = pSock->Read(&tbuff[idx],sizeof(tbuff) - idx,0,10);
+		if(rc <= 0)
+			{
+			stat = rc;
+			if(stat != TCPSOCKERR && stat!=0)
+				stat = -2;
+			break;
+			}
+
+		if((pc = (char *)memchr(tbuff,'\r',rc)) || (pc= (char *)memchr(tbuff,'\n',rc)))
+			{
+			*pc = '\0';
+			idx = 0;
+			break;
+			}
+		idx += rc;
+		}
+
+	if(stat < NwnStatusOK)
+		break;
+
+        ProcessRequests(pSock,tbuff,thrd_id);
+	/*if(ProcessRequests(pSock,tbuff,thrd_id) < NwnStatusOK)
+		pSock->Write("E\n",2);*/
+	}
+
+ return stat;
+ }	// HandleRequests
+
+// ======================================================================
+// ======================================================================
+static NwnStatus HandleConnection(SOCKET fd,ThrdId thrd_id)
+ {
+ tcpsock	*pRqSock;
+ NwnStatus	status;
+
+ // create unique socket for this connection
+ pRqSock = new tcpsock(fd);
+ if(!pRqSock)
+	return NwnStatusMemory;
+
+ // handle request(s) for the connection
+ status = HandleRequests(pRqSock,thrd_id);
+
+ delete pRqSock;
+
+ return status;
+ }	// HandleConnection
+
+// ======================================================================
+// ======================================================================
+static void *HandleConnectionMt(Ptl *pt)
+ {
+ SOCKET fd;
+ int	thread_instance,rc;
+
+ // ignore any SIGPIPE signals from socket calls, we check return codes
+ signal(SIGPIPE,SIG_IGN);
+
+ // we offset the instance number by 1 to index properly in the thread-info
+ // array. Index 0 of the array is for the main thread, 1 and up are for
+ // the worker threads, which is what is executing now.
+ thread_instance = (int)pt->GetArg() + 1;
+ fd = (SOCKET)pt->GetArg();
+
+ // set some default values in thread-info structure
+ pti[thread_instance].ti_log_fp = fopen(pti[thread_instance].ti_log_name,"a");
+ time(&pti[thread_instance].ti_last_conn_time);
+
+
+ // service the connection
+ rc = HandleConnection(fd,(ThrdId)thread_instance);
+
+
+ // free resources
+ fclose(pti[thread_instance].ti_log_fp);
+ pt->EndThread(rc);
+
+ return (void *)rc;
+ }	// HandleConnectionMt
+
+// ======================================================================
+// ======================================================================
+static int init_thrd_info(char *log_path)
+ {
+ int x,imaxt;
+ char tmp[128],*rval;
+
+ // set cfg max number of threads plus one for driving IPC
+ Ptl::PutMaxThreads(CFG_MAX_THREADS);
+
+ // allocate space for structure (main thread + worker threads)
+ imaxt = 1 + Ptl::GetMaxThreads();
+ pti = (struct _thrd_info *)malloc(imaxt * sizeof(*pti));
+ if(!pti)
+	return -1;
+
+ memset(pti,0,imaxt * sizeof(*pti));
+
+ // initialize log file names, random number generator
+ for(x = 0;x < imaxt;++x)
+	{
+	sprintf(tmp,"/encryptionserver.%03d%03d.log",this_instance,x);
+	strcpy(pti[x].ti_log_name,log_path);
+	strcat(pti[x].ti_log_name,tmp);
+#if 0
+	pti[x].ti_rnd_data.state = NULL;
+	initstate_r(this_pid + x + time(NULL),
+		pti[x].ti_rnd_state,
+		RND_STATE_SIZE,
+		&rval,
+		&pti[x].ti_rnd_data);
+
+	// srandom_r(this_pid + x + time(NULL),&pti[x].ti_rnd_data);
+#endif
+	}
+
+ // open log for main thread
+ if(!(pti[0].ti_log_fp = fopen(pti[0].ti_log_name,"a")))
+	return -2;
+
+ // redirect stdout, stderr
+ dup2(fileno(pti[0].ti_log_fp),1);
+ dup2(fileno(pti[0].ti_log_fp),2);
+
+ return 0;
+ }	// init_thrd_info
+
+// ======================================================================
+// ======================================================================
+static int init_handle_info(void)
+ {
+ // allocate space for structure
+ if(!pti)
+	return -1;
+ pthread_mutex_init(&hdl_mutex,NULL);
+
+ return 0;
+ }
+
+
+
+// ======================================================================
+// ======================================================================
+static void DoThrdMonitor(ThrdId thrd_id)
+ {
+ int rc,status;
+
+ //logger(thrd_id,0,"DoThrdMonitor() called");
+
+ // check all threads for exit status
+ for(;;)
+	{
+	if((rc = Ptl::GetStatus(&status)) < 0)
+		{
+		if(rc != PTL_ERRNOSTATUS)
+			logger(thrd_id,0,"ERROR: GetStatus() = %d, status = %d",rc,status);
+		break;
+		}
+
+	//logger(thrd_id,0,"thread %d exited with status %d",rc + 1,status);
+	}
+ }	// DoThrdMonitor
+
+// ======================================================================
+// ======================================================================
+static void LogStats(time_t tval)
+ {
+ int		x,num_handles;
+ char		tbuff[128];
+ char           *buff=new char[256];
+ FILE		*where = stdout;
+ long		cttl = 0,lttl = 0;
+
+memset(buff, 0, 256);
+ctime_r(&tval, buff);
+fprintf(where,"==================================================================\n");
+fprintf(where,"%s",buff);
+delete buff;
+// 1st worker thread is thread 1, last workder thread is max - 1. The
+// last thread runs DriveIPC() and never ends.
+for(x = 1;x < Ptl::GetMaxThreads();++x)
+	{
+        char buff[256];
+        ctime_r(&pti[x].ti_last_conn_time, buff);
+	fprintf(where,"Thrd %d: st = %d, cn = %ld, lg = %ld, %s",x,pti[x].ti_conn_state,pti[x].ti_conn_count,pti[x].ti_login_count,buff);
+	cttl += pti[x].ti_conn_count;
+	lttl += pti[x].ti_login_count;
+	}
+
+ fprintf(where,">>>>cn ttl: %ld  lg ttl: %ld\n",cttl,lttl);
+ fprintf(where,"\n==================================================================\n");
+ fflush(where);
+ }
+
+
+// ======================================================================
+// ======================================================================
+static NwnStatus DoServer(tcpsock *pMasterSock,char *log_path,ThrdId thrd_id)
+ {
+ SOCKET		fd;
+ int		thread_instance;
+ Ptl		*pt = (Ptl *)NULL;
+ int		x;
+ time_t		tval = 0,t2;
+
+ // runlevel 1 - process has received 0 SIGTERM signals,
+ //              in full service.
+ while(runlevel == 1)
+	{
+
+	// we block here, waiting for an incoming client connection
+	fd = pMasterSock->Accept(1);
+
+	if(fd <= 0)			// may be bad, check for timeout
+		{
+		if(pMasterSock->error == TCPSOCKTIMEOUT)	// timeout (default is 1 second)
+			{
+			// cleanup finished threads
+			DoThrdMonitor(thrd_id);
+
+			if(((t2 = time(NULL)) - tval) > 300)
+				{
+				tval = t2;
+				LogStats(tval);
+				}
+			}
+		else
+			{
+			if(pMasterSock->error == EINTR)
+				{
+				DEBUG("Got EINTR",pMasterSock->error);
+				continue;
+				}
+
+			DEBUG("ERROR - WaitForClient() failed,errno=",pMasterSock->error);
+			logger(thrd_id,0,"ERROR: %s, errno = %d","WaitForClient() failed",
+				pMasterSock->error);
+			break;
+			}
+		}
+	else
+		{
+		int retry,rc;
+
+		// get a thread to handle this connection
+		for(retry = 0;retry < 10;++retry)
+			{
+			pt = new Ptl(HandleConnectionMt);
+			if(!pt)
+				{
+				logger(thrd_id,0,"ERROR: malloc failed, couldn't create thread");
+				break;
+				}
+
+			if((thread_instance = pt->GetInstance()) == PTL_ERRMAXTHREADS)
+				{
+				delete pt;
+				pt = (Ptl *)NULL;
+				DEBUG("INFO - Cleaning up terminated threads",PTL_ERRMAXTHREADS);
+				logger(thrd_id,0,"INFO - Cleaning up terminated threads");
+				DoThrdMonitor(thrd_id);
+				sleep(1);
+				}
+			else
+				break;
+			}
+
+		if(!pt)
+			{
+			close(fd);
+			DEBUG("ERROR - BAD NEWS - couldn't handle connection",retry);
+			logger(thrd_id,0,"ERROR: COULDN'T HANDLE CONNECTION!");
+			continue;
+			}
+
+		pt->PutStackSize(128000);
+		pt->PutArg((void *)thread_instance);
+		pt->PutArg((void *)fd);
+		if((rc = pt->StartThread()) < 0)
+			{
+			DEBUG("ERROR - Ptl::StartThread() failed with ",rc);
+			logger(thrd_id,0,"ERROR: Ptl::StartThread() failed with %d",rc);
+			}
+		}
+	}
+
+ // runlevel 0 - process has received 1 SIGTERM, no new connections
+ //              accepted, wait for all clients to disconnect.
+ while(runlevel == 0)
+	{
+	for(x = 1;x <= Ptl::GetMaxThreads();++x)
+		{
+		if(pti[x].ti_conn_state != ST_DISCONNECTED)
+			break;
+		}
+
+	if(x > Ptl::GetMaxThreads())
+		break;
+
+	sleep(1);
+	}
+
+ return (NwnStatus)runlevel;
+ }	// DoServer
+
+ //////////////////////////////////////////
+ //Retrieve the hostname for the
+ //machine on which the process is running.
+ //If the hostname is, for instance, 
+ //devweb02.skytelatc.com, only "devweb02"
+ //will be returned.
+ //////////////////////////////////////////
+ char *retrieveHostName() {
+      char *returnstr=new char[256];
+      memset(returnstr, 0, 256);
+      char *hostname=new char[80];
+      memset(hostname, 0, 80);
+      gethostname(hostname, 80);
+      int counter=0, x=0;
+      for (x=0; x<strlen(hostname); x++) {
+           if (hostname[x]=='.') break;
+           else {
+                returnstr[counter]=hostname[x];
+                counter++;
+           }
+      }
+      returnstr[x]='\0';
+      delete hostname;
+      return returnstr;
+ }
+
+
+// ======================================================================
+// ======================================================================
+int main(int argc, char *argv[])
+ {
+ tcpsock	*pMasterSock = NULL;
+ int		istatus;
+ ThrdId		thrd_id = 0;
+ char           *ConfigInfo=new char[256], buff[256];
+ int            configval=0;
+ //configclass    Config("encryptionserver.cfg");
+ 
+ char *thehost=retrieveHostName();
+ char *configfile=new char[1024];
+ memset(configfile, 0, 1024);
+ strcpy(configfile, "/projects2/run-full-linux/servers/encryptionserver/config_files/encryptionserver.cfg.");
+ strcat(configfile, thehost);
+ delete thehost;
+ configclass Config(configfile);
+ //Retrieve values from configuration file
+ memset(ConfigInfo, 0, 256);
+ Config.GetConfigInfo("MAX_THREADS", ConfigInfo);
+ if (ConfigInfo!=NULL && strlen(ConfigInfo)>0) {
+      configval=atoi(ConfigInfo);
+      CFG_MAX_THREADS=configval;
+ }
+ delete ConfigInfo;
+ ConfigInfo=new char[256];
+ memset(ConfigInfo, 0, 256);
+ Config.GetConfigInfo("SERVER_PORT", ConfigInfo);
+ if (ConfigInfo!=NULL && strlen(ConfigInfo)>0) {
+      CFG_JNI_PORT=new char[strlen(ConfigInfo)+1];
+      strcpy(CFG_JNI_PORT, ConfigInfo); 
+ }
+ delete ConfigInfo;
+ ConfigInfo=new char[256];
+ memset(ConfigInfo, 0, 256);
+ Config.GetConfigInfo("LOG_PATH", ConfigInfo);
+ if (ConfigInfo!=NULL && strlen(ConfigInfo)>0) {
+      CFG_LOG_PATH=new char[strlen(ConfigInfo)+1];
+      strcpy(CFG_LOG_PATH, ConfigInfo);
+ }
+ delete ConfigInfo;
+ ConfigInfo=new char[256];
+ memset(ConfigInfo, 0, 256);
+ Config.GetConfigInfo("DEBUG", ConfigInfo);
+ if (ConfigInfo!=NULL && strlen(ConfigInfo)>0) {
+      CFG_DEBUG=new char[strlen(ConfigInfo)+1];
+      strcpy(CFG_DEBUG, ConfigInfo);
+ }
+ delete ConfigInfo;
+ if(argc < 1)
+	{
+	fprintf(stderr,"\nUsage: jnisvr NocID vNocID instance fd ismgensvc ismspecsvc umssvc logpath\n");
+	return -1;
+	}
+
+ this_instance = 1;
+ if((istatus = init_thrd_info(CFG_LOG_PATH)) < 0)
+	{
+	fprintf(stderr,"\ninit_thrd_info() failed with %d\n",istatus);
+	return -4;
+	}
+ if((istatus = init_handle_info()) < 0)
+	{
+	fprintf(stderr,"\ninit_handle_info() failed with %d\n",istatus);
+	return -7;
+	}
+ // create master socket for JNI server
+ pMasterSock = new tcpsock(CFG_JNI_PORT);
+ if(!pMasterSock)
+	{
+	logger(thrd_id,0,"ERROR: Insufficient memory creating master socket");
+	fclose(pti[thrd_id].ti_log_fp);
+	free(pti);
+	return -5;
+	}
+
+ if((istatus = pMasterSock->error))
+	{
+	logger(thrd_id,0,"ERROR: Error %d creating master socket",istatus);
+	fclose(pti[thrd_id].ti_log_fp);
+	delete pMasterSock;
+	free(pti);
+	return -6;
+	}
+
+ signal(SIGTERM,sig_handler);
+ signal(SIGTRAP,SIG_IGN);
+ logger(thrd_id,0,"encryptionserver started, PID = %d",(this_pid = getpid()));
+ logger(thrd_id,0, "MAX_THREADS: %d", CFG_MAX_THREADS);
+ logger(thrd_id, 0, "SERVER_PORT: %s", CFG_JNI_PORT);
+ logger(thrd_id, 0, "LOG_PATH: %s", CFG_LOG_PATH);
+ // perform server function
+ istatus = (int)DoServer(pMasterSock,CFG_LOG_PATH,thrd_id);
+
+
+ logger(thrd_id,0,"encryption server ending, exit code = %d",istatus);
+ fclose(pti[thrd_id].ti_log_fp);
+ free(pti);
+ delete pMasterSock;
+ delete CFG_JNI_PORT;
+ delete CFG_LOG_PATH;
+ return istatus;
+ }	// main

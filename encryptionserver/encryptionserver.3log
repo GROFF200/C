@@ -1,0 +1,35 @@
+Third Degree version 5.0
+encryptionserver.third run by root on devweb01.atc.skytel.com at Thu Aug 23 10:05:59 2001
+
+No .third or //.third file found.
+
+------------------------------------------------------------------------
+------------------------------------------------------------------------
+New leaks in heap after program exit
+
+Leaks - blocks not yet deallocated but apparently not in use:
+ * A leak is not referenced by static memory, active stack frames,
+   or unleaked blocks, though it may be referenced by other leaks.
+ * A leak "not referenced by other leaks" may be the root of a leaked tree.
+ * A block referenced only by registers, unseen thread stacks, mapped memory,
+   or uninstrumented library data is falsely reported as a leak. Instrumenting
+   shared libraries, if any, may reduce the number of such cases.
+ * Any new leak lost its last reference since the previous heap report, if any.
+
+A total of 0 bytes in 0 leaks were found:
+
+Compiling application code with -g or -gN (N>0) may allow Third Degree to
+identify more problems in the program and provide more detailed reports.
+------------------------------------------------------------------------
+------------------------------------------------------------------------
+		memory layout at program exit
+                           heap    1565064 bytes [0x140002000-0x140180188]
+                          stack      18976 bytes [0x11fffb5e0-0x120000000]
+        /usr/shlib/libc.so data     145504 bytes [0x3ffc0884000-0x3ffc08a7860]
+  /usr/shlib/libpthread.so data      35952 bytes [0x3ffc0466000-0x3ffc046ec70]
+      /usr/shlib/libcxx.so data      32800 bytes [0x3ffc0660000-0x3ffc0668020]
+          encryptionserver data       8192 bytes [0x140000000-0x140002000]
+        /usr/shlib/libc.so text    1376256 bytes [0x3ff80884000-0x3ff809d4000]
+  /usr/shlib/libpthread.so text     319488 bytes [0x3ff80836000-0x3ff80884000]
+      /usr/shlib/libcxx.so text     221184 bytes [0x3ff80800000-0x3ff80836000]
+          encryptionserver text     688128 bytes [0x120000000-0x1200a8000]
